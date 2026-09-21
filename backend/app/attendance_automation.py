@@ -548,9 +548,9 @@ class AttendanceWorkbookProcessor:
           that same Present(Payable Days only) value.
         - Exited employees whose ActualLWD falls in the period's ENDING
           calendar month (e.g. August): Total = "No. of Paid Days in a
-          Month" - "No. of Days Absent/LWP" (the two columns as already
-          computed - this can go negative, by design, since those two
-          columns use different windows and that's accepted).
+          Month" - "Total No. of Absent" (the sandwich-inclusive absent
+          count, not the raw one - so the sandwich penalty is properly
+          reflected here too). This can go negative, by design.
         - Exited employees NOT covered by either point above (e.g.
           ActualLWD in an earlier month): always just their Present count
           (never gets the new-joiner bonus).
@@ -573,7 +573,7 @@ class AttendanceWorkbookProcessor:
             return calc.present_payable_days_for_starting_month_joiner(emp)
 
         if emp.status == "Exited" and metrics.get("narrow_window"):
-            return metrics["paid_days_in_month"] - metrics["absent_lwp"]
+            return metrics["paid_days_in_month"] - metrics["total_no_of_absent"]
 
         if emp.status == "Exited":
             return metrics["present"]
