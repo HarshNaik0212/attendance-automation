@@ -647,6 +647,17 @@ class AttendanceWorkbookProcessor:
             metrics["total_payed_days"] = self._total_payed_days(emp, metrics, calc)
             metrics["present_payable_days"] = self._present_payable_days(emp, metrics, calc)
 
+            # Cap: "Present(Payable Days only)" and "Final No. of Payed
+            # Days" can never exceed "No. of Paid Days in a Month" (e.g.
+            # a 31-day tracking cycle can otherwise overstate an
+            # established employee's Present in a 28/29/30-day calendar
+            # month). Negative values (the Exited-in-month formula) are
+            # left untouched - min() only ever pulls a too-high value
+            # down, never pushes a low/negative one up.
+            cap = metrics["paid_days_in_month"]
+            metrics["present_payable_days"] = min(metrics["present_payable_days"], cap)
+            metrics["total_payed_days"] = min(metrics["total_payed_days"], cap)
+
             all_unrecognized |= metrics.get("unrecognized_statuses", set())
             results.append((emp, metrics))
 
