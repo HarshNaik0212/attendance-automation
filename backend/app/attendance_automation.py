@@ -57,21 +57,20 @@ Business rules implemented (confirmed with user):
        Unpaid : Absent, Leave without Pay
      Any non-blank status matching neither list is flagged as a warning
      at the end of the run instead of being silently dropped.
-  4. Sandwich rule (per employee, based on their own weekly-off weekday(s)
-     detected from their row):
-       - Sat+Sun off employees : Friday & the following Monday both
-         Absent/LWP  -> one sandwich INSTANCE, worth 4 nopay days
-         (Fri+Sat+Sun+Mon). Saturday & Sunday (originally Weekly Off) flip
-         to unpaid.
-       - Sun-only off employees: Saturday & the following Monday both
-         Absent/LWP  -> one sandwich INSTANCE, worth 3 nopay days
-         (Sat+Sun+Mon). Sunday flips to unpaid.
-       The Sandwich column reports "<instance count> (<total nopay days>
-       days)", e.g. "2 (8 days)" if it triggered twice for a Sat+Sun-off
-       employee, or "0" if it never triggered.
-       Only the newly-flipped Weekly-Off day(s) (Sat+Sun, or just Sun) are
-       removed from the Present count; Friday/Monday were already unpaid
-       and stay counted once in the Absent/LWP column (not duplicated).
+  4. Sandwich rule (general, run-based): take any consecutive run of
+     Weekly Off / Holiday days. If the day just before the run AND the day
+     just after it are both Absent/LWP (inside the same window), the whole
+     run becomes unpaid. One sandwich INSTANCE per run, costing run length
+     + 2 nopay days (the run + its two Absent/LWP flank days):
+       LWP | Weekly Off | Weekly Off | LWP -> 1 instance, 4 days
+       LWP | Weekly Off | LWP            -> 1 instance, 3 days
+       LWP | Holiday | LWP               -> 1 instance, 3 days
+       LWP | Holiday | Weekly Off | LWP  -> 1 instance, 4 days
+     The Sandwich column reports "<instance count> (<total nopay days>
+     days)", e.g. "2 (8 days)", or "0" if it never triggered.
+     Only the flipped Weekly-Off/Holiday days are removed from Present and
+     added to "Total No. of Absent"; the Absent/LWP flank days were already
+     unpaid and stay counted once (not duplicated).
   5. Total No. of Payed Days (new joiner bonus):
        - Exited employees: always Present (no bonus, regardless of window).
        - Resigned employees using the NARROW window (point 2 above):
@@ -99,6 +98,13 @@ Business rules implemented (confirmed with user):
      point 5's Total Paid Days bonus which is Active-only). Absent/LWP,
      Sandwich, and Total Paid Days are unaffected by this and keep using
      the normal wide window.
+  7. Bonus eligibility - last 7 days: the new-joiner bonus (days_in_month -
+     25, i.e. +3/4/5/6) is NOT given when the employee had no paid working
+     day in the last 7 dates of the period (every day Absent/LWP or Weekly
+     Off/Holiday, with at least one Absent/LWP). Weekly Off/Holiday are
+     ignored ONLY for this check - they are still paid in Present under the
+     normal rules. Applies to both bonus paths (Final for ending-month
+     joiners; Present(Payable)+Final for the starting-month-tail joiners).
 """
 
 import calendar
@@ -141,6 +147,16 @@ def is_unpaid_status(status):
 
 def is_weekly_off(status):
     return normalize_status(status) == _WEEKLY_OFF_NORM
+
+
+def is_holiday(status):
+    return normalize_status(status) == "holiday"
+
+
+def is_non_working_day(status):
+    """Weekly Off or Holiday - paid days off that the sandwich rule can
+    turn unpaid, and that the last-7-days bonus check ignores."""
+    return is_weekly_off(status) or is_holiday(status)
 
 
 SATURDAY, SUNDAY, MONDAY, FRIDAY = 5, 6, 0, 4
@@ -292,8 +308,9 @@ class AttendanceCalculator:
 
         off_weekdays = emp.weekly_off_weekdays()
         days_per_instance = 4 if off_weekdays == frozenset({SATURDAY, SUNDAY}) else 3
+        weekend_flanks = set()  # (day before, day after) pairs already counted
 
-        # ---- Step 1: detect sandwich instances (only over these dates) ----
+        # ---- Step 1a: weekend sandwich (pattern-based, unchanged) ----
         for d in window_dates:
             status_d = emp.day_status.get(d)
             if not is_unpaid_status(status_d):
@@ -303,6 +320,7 @@ class AttendanceCalculator:
                 monday = d + datetime.timedelta(days=3)
                 if monday in emp.day_status and is_unpaid_status(emp.day_status.get(monday)):
                     instance_count += 1
+                    weekend_flanks.add((d, monday))
                     saturday = d + datetime.timedelta(days=1)
                     sunday = d + datetime.timedelta(days=2)
                     for extra in (saturday, sunday):
@@ -313,9 +331,40 @@ class AttendanceCalculator:
                 monday = d + datetime.timedelta(days=2)
                 if monday in emp.day_status and is_unpaid_status(emp.day_status.get(monday)):
                     instance_count += 1
+                    weekend_flanks.add((d, monday))
                     sunday = d + datetime.timedelta(days=1)
                     if sunday in window_dates and is_weekly_off(emp.day_status.get(sunday)):
                         sandwiched_dates.add(sunday)
+
+        # ---- Step 1b: holiday sandwich (new) ----
+        # A consecutive run of Weekly Off / Holiday days that contains at
+        # least one Holiday, with Absent/LWP on the day just before AND just
+        # after the run (both inside this window), becomes unpaid:
+        #   LWP | Holiday | LWP               -> Holiday unpaid (3 days)
+        #   LWP | Holiday | Weekly Off | LWP  -> both unpaid (4 days)
+        # One instance per run, costing run length + 2 days. If the same
+        # flanks were already counted by the weekend rule in Step 1a, the
+        # run's days are flipped but the instance is not counted twice.
+        holiday_nopay_days = 0
+        n = len(window_dates)
+        i = 0
+        while i < n:
+            if is_non_working_day(emp.day_status.get(window_dates[i])):
+                j = i
+                while j + 1 < n and is_non_working_day(emp.day_status.get(window_dates[j + 1])):
+                    j += 1
+                run_dates = window_dates[i:j + 1]
+                if (i > 0 and j + 1 < n
+                        and any(is_holiday(emp.day_status.get(x)) for x in run_dates)
+                        and is_unpaid_status(emp.day_status.get(window_dates[i - 1]))
+                        and is_unpaid_status(emp.day_status.get(window_dates[j + 1]))):
+                    sandwiched_dates.update(run_dates)
+                    if (window_dates[i - 1], window_dates[j + 1]) not in weekend_flanks:
+                        instance_count += 1
+                        holiday_nopay_days += len(run_dates) + 2
+                i = j + 1
+            else:
+                i += 1
 
         # ---- Step 2: tally present / absent-lwp, skipping sandwiched days from Present ----
         unrecognized = set()
@@ -335,7 +384,8 @@ class AttendanceCalculator:
             # status_d is None (blank) within window -> shouldn't normally
             # happen, but if it does, we don't count it either way.
 
-        nopay_days = instance_count * days_per_instance
+        weekend_instances = len(weekend_flanks)
+        nopay_days = weekend_instances * days_per_instance + holiday_nopay_days
         sandwich_label = f"{instance_count} ({nopay_days} days)" if instance_count else "0"
 
         return {
@@ -392,14 +442,37 @@ class AttendanceCalculator:
         tally = self._tally_window(emp, sub_window_dates)
 
         days_in_month = calendar.monthrange(self.period_end.year, self.period_end.month)[1]
-        bonus = days_in_month - 25
+        bonus = 0 if self.absent_last_7_days(emp) else days_in_month - 25
 
         return tally["present"] + bonus
+
+    def absent_last_7_days(self, emp: Employee):
+        """Eligibility check for the new-joiner bonus (+3/4/5/6 days).
+
+        True when the employee had NO paid working day in the last 7 dates
+        of the payroll period (e.g. 19th-25th): every one of those days is
+        Absent/LWP, or a Weekly Off/Holiday (ignored here, only for
+        deciding the bonus - those days are still paid in Present under the
+        normal rules), with at least one Absent/LWP. Any Present, Half Day,
+        Miss Punch Out, paid leave, or blank cell means NOT absent.
+        DOJ is irrelevant - this only matters to whoever would otherwise
+        get the bonus."""
+        has_unpaid = False
+        for d in self.period_dates[-7:]:
+            status = emp.day_status.get(d)
+            if is_unpaid_status(status):
+                has_unpaid = True
+            elif is_non_working_day(status):
+                continue
+            else:
+                return False
+        return has_unpaid
 
     def paid_days_in_month(self, emp: Employee):
         """'No. of Paid Days in a Month' column.
 
-        - Active: if DOJ falls in the ending calendar month (e.g. August),
+        - Active (and Suspended, which is treated exactly like Active):
+          if DOJ falls in the ending calendar month (e.g. August),
           prorated from DOJ: (month-end - DOJ) + 1 (e.g. DOJ=5-Aug ->
           31-5+1=27). Otherwise (DOJ in an earlier month, an established
           employee), the full calendar length of the month (e.g. 31).
@@ -437,7 +510,8 @@ class AttendanceCalculator:
                 return (month_end - emp.doj).days + 1
             return days_in_month
 
-        if emp.status == "Active":
+        # Suspended is treated exactly like Active.
+        if emp.status in ("Active", "Suspended"):
             return full_month_or_prorated_by_doj()
 
         if emp.status == "Resigned":
@@ -590,7 +664,8 @@ class AttendanceWorkbookProcessor:
 
         if doj.year == period_end.year and doj.month == period_end.month:
             days_in_month = calendar.monthrange(doj.year, doj.month)[1]
-            bonus = days_in_month - 25
+            # No bonus if absent for the whole last 7 days of the period.
+            bonus = 0 if calc.absent_last_7_days(emp) else days_in_month - 25
         else:
             # An older employee (DOJ well before this period) -> Present
             # already has no gaps, no bonus.
